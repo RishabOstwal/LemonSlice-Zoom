@@ -1,0 +1,8 @@
+.env
+.env.cloud
+.env.local
+.env.production
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
