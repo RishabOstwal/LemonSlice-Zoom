@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -9,7 +10,6 @@ from livekit.agents import (
     AgentSession,
     TurnHandlingOptions,
     inference,
-    utils,
 )
 from livekit.plugins import fishaudio, lemonslice
 
@@ -19,6 +19,7 @@ load_dotenv()
 
 AGENT_NAME = "zoom-bot"
 FISH_AUDIO_VOICE_ID = "b3d59ac5857a4506ae99be06205f10fe"
+MEETING_GREETING_SETTLE_SECONDS = 10
 server = AgentServer()
 
 
@@ -32,6 +33,10 @@ def create_avatar() -> lemonslice.AvatarSession:
 
     return lemonslice.AvatarSession(
         agent_image_url=image_url,
+        # Let LiveKit adapt the video layer to the Zoom relay's bandwidth.
+        simulcast=True,
+        # Outlast the 40-minute meeting shown, while closing abandoned sessions.
+        idle_timeout=3600,
         agent_prompt=(
             "Lil Spark speaks with bright, confident energy and a playful, friendly "
             "expression. Use natural speech movement, direct eye contact, and small "
@@ -95,12 +100,22 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         tts=create_tts(),
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(),
-            interruption={"mode": "adaptive"},
+            interruption={
+                "mode": "adaptive",
+                # Require sustained, recognizable speech before cancelling avatar
+                # audio; short echo/noise was causing mid-utterance cutoffs.
+                "min_duration": 1.2,
+                "min_words": 2,
+                # This avatar output cannot pause and resume interrupted audio.
+                "resume_false_interruption": False,
+            },
         ),
     )
     avatar = create_avatar()
 
     await avatar.start(session, room=ctx.room)
+    # Don't invite or greet the avatar until its video track is live.
+    await avatar.wait_for_join(timeout=30)
     await avatar.join_meeting(
         metadata["meeting_url"],
         bot_name=metadata["bot_name"],
@@ -127,13 +142,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         room_options=avatar.room_options(),
     )
 
-    # Wait for the avatar participant to arrive before it speaks.
-    await utils.wait_for_agent(ctx.room)
-    await session.generate_reply(
-        instructions=(
-            "Introduce yourself briefly as Lil Spark and offer to help the meeting."
-        ),
+    # join_meeting returns before Zoom's remote media path is confirmed ready.
+    # Give the meeting relay time to settle before sending the opening greeting.
+    await asyncio.sleep(MEETING_GREETING_SETTLE_SECONDS)
+
+    # If someone has already started talking, answer that turn instead of playing
+    # a stale welcome after the conversation has begun.
+    has_user_spoken = any(
+        message.role == "user" for message in session.history.messages()
     )
+    if session.user_state != "speaking" and not has_user_spoken:
+        await session.say(
+            "Hi, everyone. I'm Lil Spark, and I'm ready to help.",
+            allow_interruptions=False,
+        )
 
 
 if __name__ == "__main__":
